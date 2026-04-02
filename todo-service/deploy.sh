@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
+# deploy.sh — Deprecated: use setup.sh for the full Dynatrace POC setup.
+# This script still works for app-only deployments (no Dynatrace).
 set -euo pipefail
 
 # ============================================================
 # deploy.sh — Build & deploy Todo Service to local minikube
 # ============================================================
 
-NAMESPACE="todo-app"
+NAMESPACE="demo"
 IMAGE_NAME="todo-service"
 IMAGE_TAG="latest"
 

@@ -28,3 +28,9 @@ management:
   endpoint:
     health:
       show-details: always
+
+logging:
+  config: classpath:logback-spring.xml
+  level:
+    com.example.todoservice: INFO
+    org.springframework.web: INFO

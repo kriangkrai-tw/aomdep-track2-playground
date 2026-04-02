@@ -2,7 +2,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: todo-service
-  namespace: todo-app
+  namespace: demo
   labels:
     app: todo-service
 spec:
@@ -13,5 +13,4 @@ spec:
       port: 80
       targetPort: 8080
       nodePort: 30080
-  # NodePort exposes the service on each node's IP - accessible via minikube ip
   type: NodePort

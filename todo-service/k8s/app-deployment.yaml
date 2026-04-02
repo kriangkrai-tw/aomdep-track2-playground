@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: todo-service
-  namespace: todo-app
+  namespace: demo
   labels:
     app: todo-service
 spec:
@@ -14,11 +14,12 @@ spec:
     metadata:
       labels:
         app: todo-service
+      annotations:
+        oneagent.dynatrace.com/inject: "true"
     spec:
       containers:
         - name: todo-service
           image: todo-service:latest
-          # Tell minikube to use the local image (not pull from registry)
           imagePullPolicy: Never
           ports:
             - containerPort: 8080

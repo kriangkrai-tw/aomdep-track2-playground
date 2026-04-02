@@ -1,0 +1,11 @@
+apiVersion: dynatrace.com/v1beta6
+kind: DynaKube
+metadata:
+  name: dynakube
+  namespace: dynatrace
+  annotations:
+    feature.dynatrace.com/automatic-kubernetes-api-monitoring: "true"
+spec:
+  apiUrl: https://${DT_ENV_ID}.live.dynatrace.com/api
+  oneAgent:
+    applicationMonitoring: {}

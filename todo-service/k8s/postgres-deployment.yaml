@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: postgres
-  namespace: todo-app
+  namespace: demo
   labels:
     app: postgres
 spec:
