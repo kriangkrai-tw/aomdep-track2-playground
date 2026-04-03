@@ -12,6 +12,5 @@ spec:
     - protocol: TCP
       port: 80
       targetPort: 8080
-      nodePort: 30080
-  # NodePort exposes the service on each node's IP - accessible via minikube ip
+      # nodePort auto-assigned by Kubernetes to avoid conflicts
   type: NodePort
