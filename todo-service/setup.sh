@@ -4,7 +4,7 @@ set -euo pipefail
 
 # ============================================================
 # setup.sh — Idempotent setup of Dynatrace + todo-service POC
-#            on local Minikube
+#            on local Kubernetes via Colima
 # ============================================================
 #
 # Required env vars (export before running):
@@ -34,7 +34,7 @@ info "All required environment variables are set."
 
 # ── 2. Check prerequisites ────────────────────────────────────
 step "Checking prerequisites"
-for cmd in kubectl helm minikube docker envsubst; do
+for cmd in kubectl helm colima docker envsubst; do
   if ! command -v "${cmd}" &>/dev/null; then
     err "'${cmd}' is not installed. See README.md for installation instructions."
     exit 1
@@ -42,58 +42,61 @@ for cmd in kubectl helm minikube docker envsubst; do
 done
 info "All prerequisites found."
 
-# ── 3. Start Minikube ─────────────────────────────────────────
-step "Starting Minikube"
-if minikube status --format '{{.Host}}' 2>/dev/null | grep -q "Running"; then
-  NODE_ARCH=$(kubectl get node -o jsonpath='{.items[0].status.nodeInfo.architecture}' 2>/dev/null || echo "unknown")
-  if [[ "${NODE_ARCH}" == "arm64" ]]; then
-    err "Minikube is running as ARM64. Dynatrace OneAgent requires x86_64 Linux."
-    echo ""
-    echo "  Fix: delete the cluster and re-run — setup.sh will use the qemu2 driver."
-    echo "    minikube delete && ./setup.sh"
-    echo "  Prerequisite: brew install qemu"
-    exit 1
-  fi
-  info "Minikube is already running (arch: ${NODE_ARCH})."
-else
-  # Detect Apple Silicon — Dynatrace OneAgent requires x86_64 Linux.
-  # --driver=docker with linux/amd64 emulation doesn't work (kicbase SEGV under Rosetta 2).
-  # --driver=qemu2 with the amd64 ISO + x86_64 EFI firmware runs a real x86_64 VM via QEMU.
-  HOST_ARCH=$(uname -m)
-  MK_MEMORY=8192
-  if [[ "${HOST_ARCH}" == "arm64" ]]; then
-    if ! command -v qemu-system-x86_64 &>/dev/null; then
-      err "QEMU is required on Apple Silicon (Dynatrace OneAgent requires x86_64 Linux)."
-      echo "  Install QEMU:  brew install qemu"
-      echo "  Then re-run:   ./setup.sh"
-      exit 1
-    fi
-    # Locate the x86_64 EFI firmware installed by brew
-    QEMU_FW=$(find /opt/homebrew /usr/local -name "edk2-x86_64-code.fd" 2>/dev/null | head -1)
-    if [[ -z "${QEMU_FW}" ]]; then
-      err "Could not find edk2-x86_64-code.fd. Ensure QEMU is installed via brew install qemu."
-      exit 1
-    fi
-    MK_VERSION=$(minikube version --short 2>/dev/null | sed 's/^v//' || echo "1.38.1")
-    # ISOs are attached to minikube GitHub releases starting from v1.32+.
-    # For older versions, fall back to the latest known ISO.
-    ISO_VERSION="${MK_VERSION}"
-    if ! curl -sf --head \
-      "https://github.com/kubernetes/minikube/releases/download/v${ISO_VERSION}/minikube-v${ISO_VERSION}-amd64.iso" \
-      &>/dev/null; then
-      ISO_VERSION="1.38.1"
-    fi
-    AMDISO="https://github.com/kubernetes/minikube/releases/download/v${ISO_VERSION}/minikube-v${ISO_VERSION}-amd64.iso"
-    echo "🍎 Apple Silicon + QEMU detected — starting Minikube as x86_64 VM."
-    echo "   ISO:      ${AMDISO}"
-    echo "   Firmware: ${QEMU_FW}"
-    minikube start --driver=qemu2 --cpus=4 --memory="${MK_MEMORY}" --disk-size=20g \
-      --iso-url="${AMDISO}" \
-      --qemu-firmware-path="${QEMU_FW}"
+# ── 3. Start Colima Kubernetes cluster ────────────────────────
+step "Starting Colima Kubernetes cluster"
+HOST_ARCH=$(uname -m)
+IS_QEMU=false
+
+if [[ "${HOST_ARCH}" == "arm64" ]]; then
+  # Apple Silicon: OneAgent requires x86_64 Linux — run a QEMU x86_64 VM.
+  # Ubuntu 24.04 (glibc 2.39) requires SSE4.2/POPCNT; must be added to cpu-type.
+  COLIMA_PROFILE="x86k8s"
+  IS_QEMU=true
+  if colima status --profile "${COLIMA_PROFILE}" 2>/dev/null | grep -q "running"; then
+    info "Colima profile '${COLIMA_PROFILE}' is already running (x86_64 QEMU)."
   else
-    echo "🚀 Starting Minikube (4 CPU, ${MK_MEMORY} MB RAM, Docker driver)..."
-    minikube start --cpus=4 --memory="${MK_MEMORY}" --driver=docker
+    echo "🍎 Apple Silicon detected — starting Colima x86_64 QEMU VM..."
+    echo "   ⚠️  First start takes 5-10 min (VM creation + Kubernetes bootstrap)."
+    colima start \
+      --profile "${COLIMA_PROFILE}" \
+      --arch x86_64 \
+      --vm-type qemu \
+      --cpu-type "qemu64,+ssse3,+sse4.1,+sse4.2,+popcnt,+cx16,+lahf_lm" \
+      --cpu 4 \
+      --memory 8 \
+      --disk 30 \
+      --runtime docker \
+      --kubernetes
   fi
+else
+  # Intel Mac: native x86_64 — no emulation needed.
+  COLIMA_PROFILE="k8s"
+  if colima status --profile "${COLIMA_PROFILE}" 2>/dev/null | grep -q "running"; then
+    info "Colima profile '${COLIMA_PROFILE}' is already running."
+  else
+    echo "🚀 Starting Colima Kubernetes cluster (4 CPU, 8 GB RAM)..."
+    colima start \
+      --profile "${COLIMA_PROFILE}" \
+      --cpu 4 \
+      --memory 8 \
+      --disk 30 \
+      --runtime docker \
+      --kubernetes
+  fi
+fi
+
+DOCKER_SOCK="${HOME}/.colima/${COLIMA_PROFILE}/docker.sock"
+
+# Point kubectl at the Colima cluster
+kubectl config use-context "colima-${COLIMA_PROFILE}"
+NODE_ARCH=$(kubectl get node -o jsonpath='{.items[0].status.nodeInfo.architecture}' 2>/dev/null || echo "unknown")
+info "Cluster ready. Node architecture: ${NODE_ARCH}"
+
+if [[ "${NODE_ARCH}" == "arm64" ]]; then
+  err "Cluster node is ARM64 — Dynatrace OneAgent requires x86_64."
+  echo "  Fix: delete the profile and re-run:"
+  echo "    colima delete --profile ${COLIMA_PROFILE} && ./setup.sh"
+  exit 1
 fi
 
 # ── 4. Install Dynatrace Operator via Helm (OCI registry) ────
@@ -133,102 +136,57 @@ info "DynaKube CR applied (cloudNativeFullStack + logMonitoring)."
 echo "⏳ Waiting 15 s for operator webhook to register injection config..."
 sleep 15
 
-# ── 7b. Minikube / Docker-driver workarounds for Dynatrace on Rosetta 2 ─
-# The operator hard-codes amd64-only nodeAffinity and tight probe timeouts.
-# The OneAgent also needs its CSI osagent volume host-path resolved correctly —
-# on Minikube+Docker-driver the mountinfo paths use the Docker volume prefix
-# which the OneAgent can't stat() through a symlink; a bind mount is required.
-step "Applying Minikube/Apple-Silicon workarounds"
-NODE_ARCH=$(kubectl get node -o jsonpath='{.items[0].status.nodeInfo.architecture}' 2>/dev/null || echo "unknown")
-echo "Node architecture: ${NODE_ARCH}"
+# ── 7b. Patch probe timeouts for QEMU (Apple Silicon) ────────────────────────
+# Under QEMU TCG emulation, containers start much slower than native.
+# The operator and ActiveGate have tight default probe timeouts that cause
+# unnecessary restarts on QEMU. Patch them to use generous timeouts.
+step "Applying QEMU probe timeout patches"
 
-# ── 7b-i. ActiveGate: arch affinity + extended probe timeouts ────────────
-echo "⏳ Waiting for ActiveGate StatefulSet..."
-AG_TIMEOUT=60
-until kubectl get statefulset dynakube-activegate -n dynatrace &>/dev/null; do
-  AG_TIMEOUT=$((AG_TIMEOUT - 5))
-  if [[ "${AG_TIMEOUT}" -le 0 ]]; then warn "ActiveGate StatefulSet not yet created — skipping."; break; fi
-  sleep 5
-done
+if [[ "${IS_QEMU}" == "true" ]]; then
+  # Patch Dynatrace operator startup probe (default timeoutSeconds=5 is too tight)
+  if kubectl get deployment dynatrace-operator -n dynatrace &>/dev/null; then
+    kubectl patch deployment dynatrace-operator -n dynatrace --type=json -p='[
+      {"op":"replace","path":"/spec/template/spec/containers/0/startupProbe/timeoutSeconds","value":30},
+      {"op":"replace","path":"/spec/template/spec/containers/0/startupProbe/failureThreshold","value":6},
+      {"op":"replace","path":"/spec/template/spec/containers/0/startupProbe/periodSeconds","value":15}
+    ]' 2>/dev/null && info "Operator startupProbe patched for QEMU." || true
+  fi
 
-if kubectl get statefulset dynakube-activegate -n dynatrace &>/dev/null; then
-  if kubectl patch statefulset dynakube-activegate -n dynatrace --type=json -p='[
-    {"op":"replace","path":"/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/0/values","value":["amd64","arm64"]},
-    {"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/initialDelaySeconds","value":180},
-    {"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/failureThreshold","value":4},
-    {"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/timeoutSeconds","value":10},
-    {"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/initialDelaySeconds","value":180},
-    {"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/failureThreshold","value":6},
-    {"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/timeoutSeconds","value":10}
-  ]'; then
-    info "ActiveGate patched (arch affinity + extended probe timeouts)."
+  # ActiveGate: wait for StatefulSet then patch probe timeouts
+  echo "⏳ Waiting for ActiveGate StatefulSet..."
+  AG_TIMEOUT=60
+  until kubectl get statefulset dynakube-activegate -n dynatrace &>/dev/null; do
+    AG_TIMEOUT=$((AG_TIMEOUT - 5))
+    if [[ "${AG_TIMEOUT}" -le 0 ]]; then
+      warn "ActiveGate StatefulSet not yet created — skipping probe patch."
+      break
+    fi
+    sleep 5
+  done
+
+  if kubectl get statefulset dynakube-activegate -n dynatrace &>/dev/null; then
+    kubectl patch statefulset dynakube-activegate -n dynatrace --type=json -p='[
+      {"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/initialDelaySeconds","value":360},
+      {"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/failureThreshold","value":6},
+      {"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/timeoutSeconds","value":15},
+      {"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/periodSeconds","value":30},
+      {"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/initialDelaySeconds","value":360},
+      {"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/failureThreshold","value":8},
+      {"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/timeoutSeconds","value":15},
+      {"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/periodSeconds","value":30}
+    ]' 2>/dev/null && info "ActiveGate probes patched for QEMU." || true
     kubectl delete pod -n dynatrace \
       -l app.kubernetes.io/name=dynakube,app.kubernetes.io/component=activegate \
       --ignore-not-found 2>/dev/null || true
-  else
-    warn "Could not patch ActiveGate StatefulSet."
   fi
+else
+  info "Native x86_64 host — skipping QEMU probe patches."
 fi
 
-# ── 7b-ii. OneAgent DaemonSet: arch affinity ─────────────────────────────
-echo "⏳ Waiting for OneAgent DaemonSet..."
-OA_TIMEOUT=60
-until kubectl get daemonset dynakube-oneagent -n dynatrace &>/dev/null; do
-  OA_TIMEOUT=$((OA_TIMEOUT - 5))
-  if [[ "${OA_TIMEOUT}" -le 0 ]]; then warn "OneAgent DaemonSet not yet created — skipping."; break; fi
-  sleep 5
-done
-
-if kubectl get daemonset dynakube-oneagent -n dynatrace &>/dev/null; then
-  if kubectl patch daemonset dynakube-oneagent -n dynatrace --type=json -p='[
-    {"op":"replace","path":"/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/0/values","value":["amd64","arm64"]}
-  ]'; then
-    info "OneAgent DaemonSet patched (arch affinity)."
-  else
-    warn "Could not patch OneAgent DaemonSet."
-  fi
-fi
-
-# ── 7b-iii. OneAgent osagent bind mount (Minikube Docker-driver workaround) ─
-# On Minikube+Docker-driver, /proc/self/mountinfo reports the CSI osagent volume
-# source path using the Docker volume prefix (/var/lib/docker/volumes/minikube/_data/...).
-# The OneAgent tries to stat() this path via /mnt/root/ and fails unless the path
-# exists on the node. A bind mount makes both paths point to the same real inode.
-OSAGENT_REAL="/var/lib/kubelet/plugins/csi.oneagent.dynatrace.com/data/_dynakubes/dynakube/osagent"
-OSAGENT_MIRROR="/var/lib/docker/volumes/minikube/_data/lib/kubelet/plugins/csi.oneagent.dynatrace.com/data/_dynakubes/dynakube/osagent"
-
-echo "⏳ Waiting for CSI osagent directory to be created by the operator..."
-CSI_TIMEOUT=120
-until minikube ssh -- "sudo test -d '${OSAGENT_REAL}'" 2>/dev/null; do
-  CSI_TIMEOUT=$((CSI_TIMEOUT - 5))
-  if [[ "${CSI_TIMEOUT}" -le 0 ]]; then
-    warn "CSI osagent directory not found — skipping bind mount. OneAgent may fail to start."
-    break
-  fi
-  sleep 5
-done
-
-if minikube ssh -- "sudo test -d '${OSAGENT_REAL}'" 2>/dev/null; then
-  # Check if bind mount already exists (idempotent)
-  if ! minikube ssh -- "sudo mountpoint -q '${OSAGENT_MIRROR}'" 2>/dev/null; then
-    if minikube ssh -- "
-      sudo mkdir -p '${OSAGENT_MIRROR}' && \
-      sudo mount --bind '${OSAGENT_REAL}' '${OSAGENT_MIRROR}'
-    " 2>/dev/null; then
-      info "OneAgent osagent bind mount created."
-    else
-      warn "Could not create osagent bind mount — OneAgent may fail to start."
-    fi
-  else
-    info "OneAgent osagent bind mount already exists."
-  fi
-fi
-
-# ── 8. Build app image inside Minikube's Docker daemon ───────
+# ── 8. Build app image into Colima's Docker daemon ───────────
 step "Building todo-service Docker image"
-echo "🔧 Pointing Docker CLI at Minikube's daemon..."
-# shellcheck disable=SC2046
-eval "$(minikube docker-env)"
+export DOCKER_HOST="unix://${DOCKER_SOCK}"
+echo "🔧 Using Docker socket: ${DOCKER_HOST}"
 echo "🐳 Building todo-service:latest..."
 docker build -t todo-service:latest .
 
@@ -253,17 +211,20 @@ kubectl rollout restart deployment/todo-service -n todo-app
 # ── 10. Wait for pods to be ready ─────────────────────────────
 step "Waiting for pods"
 echo "⏳ PostgreSQL..."
-kubectl rollout status deployment/postgres -n todo-app --timeout=120s
+kubectl rollout status deployment/postgres -n todo-app --timeout=300s
 
-echo "⏳ todo-service..."
-kubectl rollout status deployment/todo-service -n todo-app --timeout=180s
+echo ""
+echo "⏳ todo-service (Spring Boot startup takes ~10-12 min on QEMU — be patient)..."
+echo "   Watch logs: kubectl logs -n todo-app -l app=todo-service -f"
+kubectl rollout status deployment/todo-service -n todo-app --timeout=900s \
+  || warn "todo-service not yet ready — Spring Boot is still starting. Check: kubectl get pods -n todo-app"
 
-echo "⏳ Dynatrace ActiveGate (first install may take several minutes)..."
+echo "⏳ Dynatrace ActiveGate (first install takes several minutes on QEMU)..."
 kubectl -n dynatrace wait pod \
   --for=condition=ready \
   --selector=app.kubernetes.io/name=dynakube,app.kubernetes.io/component=activegate \
-  --timeout=300s 2>/dev/null \
-  || warn "ActiveGate not yet ready — it may still be initialising. Check: kubectl get pods -n dynatrace"
+  --timeout=600s 2>/dev/null \
+  || warn "ActiveGate not yet ready — still initialising. Check: kubectl get pods -n dynatrace"
 
 # ── 11. Status summary ────────────────────────────────────────
 echo ""
