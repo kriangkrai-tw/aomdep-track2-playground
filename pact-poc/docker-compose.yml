@@ -1,0 +1,31 @@
+version: "3"
+
+services:
+  postgres:
+    image: postgres:13
+    healthcheck:
+      test: psql postgres --command "select 1" -U postgres
+    volumes:
+      - postgres-volume:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: postgres
+
+  pact-broker:
+    image: pactfoundation/pact-broker:latest
+    ports:
+      - "9292:9292"
+    depends_on:
+      - postgres
+    environment:
+      PACT_BROKER_PORT: '9292'
+      PACT_BROKER_DATABASE_URL: "postgres://postgres:password@postgres/postgres"
+      PACT_BROKER_LOG_LEVEL: INFO
+      PACT_BROKER_SQL_LOG_LEVEL: DEBUG
+      PACT_BROKER_DATABASE_CONNECT_MAX_RETRIES: "5"
+      # The list of allowed base URLs (protects against cache poisoning)
+      PACT_BROKER_BASE_URL: 'http://localhost http://localhost:9292 http://host.docker.internal:9292'
+
+volumes:
+  postgres-volume:
