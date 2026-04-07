@@ -44,13 +44,17 @@ spec:
           readinessProbe:
             exec:
               command: ["pg_isready", "-U", "postgres", "-d", "tododb"]
-            initialDelaySeconds: 5
+            initialDelaySeconds: 30
             periodSeconds: 5
+            failureThreshold: 6
+            timeoutSeconds: 10
           livenessProbe:
             exec:
               command: ["pg_isready", "-U", "postgres", "-d", "tododb"]
-            initialDelaySeconds: 30
+            initialDelaySeconds: 60
             periodSeconds: 10
+            failureThreshold: 6
+            timeoutSeconds: 10
           resources:
             requests:
               memory: "256Mi"

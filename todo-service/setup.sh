@@ -45,11 +45,55 @@ info "All prerequisites found."
 # ── 3. Start Minikube ─────────────────────────────────────────
 step "Starting Minikube"
 if minikube status --format '{{.Host}}' 2>/dev/null | grep -q "Running"; then
-  info "Minikube is already running."
+  NODE_ARCH=$(kubectl get node -o jsonpath='{.items[0].status.nodeInfo.architecture}' 2>/dev/null || echo "unknown")
+  if [[ "${NODE_ARCH}" == "arm64" ]]; then
+    err "Minikube is running as ARM64. Dynatrace OneAgent requires x86_64 Linux."
+    echo ""
+    echo "  Fix: delete the cluster and re-run — setup.sh will use the qemu2 driver."
+    echo "    minikube delete && ./setup.sh"
+    echo "  Prerequisite: brew install qemu"
+    exit 1
+  fi
+  info "Minikube is already running (arch: ${NODE_ARCH})."
 else
-  echo "🚀 Starting Minikube (4 CPU, 8 GB RAM, Docker driver)..."
-  echo "   On Apple Silicon: Docker Desktop must have 'Use Rosetta for x86/amd64 emulation' enabled."
-  minikube start --cpus=4 --memory=8192 --driver=docker
+  # Detect Apple Silicon — Dynatrace OneAgent requires x86_64 Linux.
+  # --driver=docker with linux/amd64 emulation doesn't work (kicbase SEGV under Rosetta 2).
+  # --driver=qemu2 with the amd64 ISO + x86_64 EFI firmware runs a real x86_64 VM via QEMU.
+  HOST_ARCH=$(uname -m)
+  MK_MEMORY=8192
+  if [[ "${HOST_ARCH}" == "arm64" ]]; then
+    if ! command -v qemu-system-x86_64 &>/dev/null; then
+      err "QEMU is required on Apple Silicon (Dynatrace OneAgent requires x86_64 Linux)."
+      echo "  Install QEMU:  brew install qemu"
+      echo "  Then re-run:   ./setup.sh"
+      exit 1
+    fi
+    # Locate the x86_64 EFI firmware installed by brew
+    QEMU_FW=$(find /opt/homebrew /usr/local -name "edk2-x86_64-code.fd" 2>/dev/null | head -1)
+    if [[ -z "${QEMU_FW}" ]]; then
+      err "Could not find edk2-x86_64-code.fd. Ensure QEMU is installed via brew install qemu."
+      exit 1
+    fi
+    MK_VERSION=$(minikube version --short 2>/dev/null | sed 's/^v//' || echo "1.38.1")
+    # ISOs are attached to minikube GitHub releases starting from v1.32+.
+    # For older versions, fall back to the latest known ISO.
+    ISO_VERSION="${MK_VERSION}"
+    if ! curl -sf --head \
+      "https://github.com/kubernetes/minikube/releases/download/v${ISO_VERSION}/minikube-v${ISO_VERSION}-amd64.iso" \
+      &>/dev/null; then
+      ISO_VERSION="1.38.1"
+    fi
+    AMDISO="https://github.com/kubernetes/minikube/releases/download/v${ISO_VERSION}/minikube-v${ISO_VERSION}-amd64.iso"
+    echo "🍎 Apple Silicon + QEMU detected — starting Minikube as x86_64 VM."
+    echo "   ISO:      ${AMDISO}"
+    echo "   Firmware: ${QEMU_FW}"
+    minikube start --driver=qemu2 --cpus=4 --memory="${MK_MEMORY}" --disk-size=20g \
+      --iso-url="${AMDISO}" \
+      --qemu-firmware-path="${QEMU_FW}"
+  else
+    echo "🚀 Starting Minikube (4 CPU, ${MK_MEMORY} MB RAM, Docker driver)..."
+    minikube start --cpus=4 --memory="${MK_MEMORY}" --driver=docker
+  fi
 fi
 
 # ── 4. Install Dynatrace Operator via Helm (OCI registry) ────
@@ -89,27 +133,25 @@ info "DynaKube CR applied (cloudNativeFullStack + logMonitoring)."
 echo "⏳ Waiting 15 s for operator webhook to register injection config..."
 sleep 15
 
-# ── 7b. Apple Silicon / ARM64 — fix ActiveGate arch affinity & probes ─
-# The operator sets amd64-only nodeAffinity and probe timeouts that are
-# too tight for Rosetta 2 emulation on Apple Silicon.
-step "Patching ActiveGate for ARM64 compatibility"
+# ── 7b. Minikube / Docker-driver workarounds for Dynatrace on Rosetta 2 ─
+# The operator hard-codes amd64-only nodeAffinity and tight probe timeouts.
+# The OneAgent also needs its CSI osagent volume host-path resolved correctly —
+# on Minikube+Docker-driver the mountinfo paths use the Docker volume prefix
+# which the OneAgent can't stat() through a symlink; a bind mount is required.
+step "Applying Minikube/Apple-Silicon workarounds"
 NODE_ARCH=$(kubectl get node -o jsonpath='{.items[0].status.nodeInfo.architecture}' 2>/dev/null || echo "unknown")
-echo "Detected node architecture: ${NODE_ARCH}"
+echo "Node architecture: ${NODE_ARCH}"
 
-# Wait up to 60 s for the StatefulSet to be created by the operator
-echo "⏳ Waiting for ActiveGate StatefulSet to be created..."
+# ── 7b-i. ActiveGate: arch affinity + extended probe timeouts ────────────
+echo "⏳ Waiting for ActiveGate StatefulSet..."
 AG_TIMEOUT=60
 until kubectl get statefulset dynakube-activegate -n dynatrace &>/dev/null; do
   AG_TIMEOUT=$((AG_TIMEOUT - 5))
-  if [[ "${AG_TIMEOUT}" -le 0 ]]; then
-    warn "ActiveGate StatefulSet not yet created — skipping patch."
-    break
-  fi
+  if [[ "${AG_TIMEOUT}" -le 0 ]]; then warn "ActiveGate StatefulSet not yet created — skipping."; break; fi
   sleep 5
 done
 
 if kubectl get statefulset dynakube-activegate -n dynatrace &>/dev/null; then
-  # Atomic patch: extend arch affinity to arm64 + increase probe timeouts for Rosetta
   if kubectl patch statefulset dynakube-activegate -n dynatrace --type=json -p='[
     {"op":"replace","path":"/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/0/values","value":["amd64","arm64"]},
     {"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/initialDelaySeconds","value":180},
@@ -119,13 +161,66 @@ if kubectl get statefulset dynakube-activegate -n dynatrace &>/dev/null; then
     {"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/failureThreshold","value":6},
     {"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/timeoutSeconds","value":10}
   ]'; then
-    info "ActiveGate StatefulSet patched (arm64 affinity + extended probe timeouts)."
-    # Bounce any running pod so it picks up the new probe settings
+    info "ActiveGate patched (arch affinity + extended probe timeouts)."
     kubectl delete pod -n dynatrace \
       -l app.kubernetes.io/name=dynakube,app.kubernetes.io/component=activegate \
       --ignore-not-found 2>/dev/null || true
   else
-    warn "Could not patch ActiveGate StatefulSet — may need manual patching on Apple Silicon."
+    warn "Could not patch ActiveGate StatefulSet."
+  fi
+fi
+
+# ── 7b-ii. OneAgent DaemonSet: arch affinity ─────────────────────────────
+echo "⏳ Waiting for OneAgent DaemonSet..."
+OA_TIMEOUT=60
+until kubectl get daemonset dynakube-oneagent -n dynatrace &>/dev/null; do
+  OA_TIMEOUT=$((OA_TIMEOUT - 5))
+  if [[ "${OA_TIMEOUT}" -le 0 ]]; then warn "OneAgent DaemonSet not yet created — skipping."; break; fi
+  sleep 5
+done
+
+if kubectl get daemonset dynakube-oneagent -n dynatrace &>/dev/null; then
+  if kubectl patch daemonset dynakube-oneagent -n dynatrace --type=json -p='[
+    {"op":"replace","path":"/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/0/values","value":["amd64","arm64"]}
+  ]'; then
+    info "OneAgent DaemonSet patched (arch affinity)."
+  else
+    warn "Could not patch OneAgent DaemonSet."
+  fi
+fi
+
+# ── 7b-iii. OneAgent osagent bind mount (Minikube Docker-driver workaround) ─
+# On Minikube+Docker-driver, /proc/self/mountinfo reports the CSI osagent volume
+# source path using the Docker volume prefix (/var/lib/docker/volumes/minikube/_data/...).
+# The OneAgent tries to stat() this path via /mnt/root/ and fails unless the path
+# exists on the node. A bind mount makes both paths point to the same real inode.
+OSAGENT_REAL="/var/lib/kubelet/plugins/csi.oneagent.dynatrace.com/data/_dynakubes/dynakube/osagent"
+OSAGENT_MIRROR="/var/lib/docker/volumes/minikube/_data/lib/kubelet/plugins/csi.oneagent.dynatrace.com/data/_dynakubes/dynakube/osagent"
+
+echo "⏳ Waiting for CSI osagent directory to be created by the operator..."
+CSI_TIMEOUT=120
+until minikube ssh -- "sudo test -d '${OSAGENT_REAL}'" 2>/dev/null; do
+  CSI_TIMEOUT=$((CSI_TIMEOUT - 5))
+  if [[ "${CSI_TIMEOUT}" -le 0 ]]; then
+    warn "CSI osagent directory not found — skipping bind mount. OneAgent may fail to start."
+    break
+  fi
+  sleep 5
+done
+
+if minikube ssh -- "sudo test -d '${OSAGENT_REAL}'" 2>/dev/null; then
+  # Check if bind mount already exists (idempotent)
+  if ! minikube ssh -- "sudo mountpoint -q '${OSAGENT_MIRROR}'" 2>/dev/null; then
+    if minikube ssh -- "
+      sudo mkdir -p '${OSAGENT_MIRROR}' && \
+      sudo mount --bind '${OSAGENT_REAL}' '${OSAGENT_MIRROR}'
+    " 2>/dev/null; then
+      info "OneAgent osagent bind mount created."
+    else
+      warn "Could not create osagent bind mount — OneAgent may fail to start."
+    fi
+  else
+    info "OneAgent osagent bind mount already exists."
   fi
 fi
 
