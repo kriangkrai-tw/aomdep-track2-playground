@@ -52,7 +52,7 @@ if [[ "${HOST_ARCH}" == "arm64" ]]; then
   # Ubuntu 24.04 (glibc 2.39) requires SSE4.2/POPCNT; must be added to cpu-type.
   COLIMA_PROFILE="x86k8s"
   IS_QEMU=true
-  if colima status --profile "${COLIMA_PROFILE}" 2>/dev/null | grep -q "running"; then
+  if colima status --profile "${COLIMA_PROFILE}" 2>/dev/null | grep -iq "running"; then
     info "Colima profile '${COLIMA_PROFILE}' is already running (x86_64 QEMU)."
   else
     echo "🍎 Apple Silicon detected — starting Colima x86_64 QEMU VM..."
@@ -71,7 +71,7 @@ if [[ "${HOST_ARCH}" == "arm64" ]]; then
 else
   # Intel Mac: native x86_64 — no emulation needed.
   COLIMA_PROFILE="k8s"
-  if colima status --profile "${COLIMA_PROFILE}" 2>/dev/null | grep -q "running"; then
+  if colima status --profile "${COLIMA_PROFILE}" 2>/dev/null | grep -iq "running"; then
     info "Colima profile '${COLIMA_PROFILE}' is already running."
   else
     echo "🚀 Starting Colima Kubernetes cluster (4 CPU, 8 GB RAM)..."
@@ -112,6 +112,30 @@ else
     --atomic
 fi
 
+# ── 4b. Patch operator startup probe for QEMU (BEFORE webhook wait) ──────────
+# The default startupProbe has timeoutSeconds=5 / failureThreshold=1 — too tight
+# for QEMU TCG emulation. The operator pod will crash-loop unless we relax this
+# BEFORE waiting for the webhook. On Intel, the patch is a no-op (probe already passes).
+if [[ "${IS_QEMU}" == "true" ]]; then
+  echo "⏳ Waiting for operator Deployment to be created..."
+  OP_TIMEOUT=60
+  until kubectl get deployment dynatrace-operator -n dynatrace &>/dev/null; do
+    OP_TIMEOUT=$((OP_TIMEOUT - 5))
+    if [[ "${OP_TIMEOUT}" -le 0 ]]; then
+      warn "dynatrace-operator Deployment not found — skipping probe patch."
+      break
+    fi
+    sleep 5
+  done
+  if kubectl get deployment dynatrace-operator -n dynatrace &>/dev/null; then
+    kubectl patch deployment dynatrace-operator -n dynatrace --type=json -p='[
+      {"op":"replace","path":"/spec/template/spec/containers/0/startupProbe/timeoutSeconds","value":30},
+      {"op":"replace","path":"/spec/template/spec/containers/0/startupProbe/failureThreshold","value":6},
+      {"op":"replace","path":"/spec/template/spec/containers/0/startupProbe/periodSeconds","value":15}
+    ]' 2>/dev/null && info "Operator startupProbe patched for QEMU." || true
+  fi
+fi
+
 # ── 5. Wait for Operator webhook ─────────────────────────────
 step "Waiting for Dynatrace Operator webhook"
 kubectl -n dynatrace wait pod \
@@ -143,15 +167,6 @@ sleep 15
 step "Applying QEMU probe timeout patches"
 
 if [[ "${IS_QEMU}" == "true" ]]; then
-  # Patch Dynatrace operator startup probe (default timeoutSeconds=5 is too tight)
-  if kubectl get deployment dynatrace-operator -n dynatrace &>/dev/null; then
-    kubectl patch deployment dynatrace-operator -n dynatrace --type=json -p='[
-      {"op":"replace","path":"/spec/template/spec/containers/0/startupProbe/timeoutSeconds","value":30},
-      {"op":"replace","path":"/spec/template/spec/containers/0/startupProbe/failureThreshold","value":6},
-      {"op":"replace","path":"/spec/template/spec/containers/0/startupProbe/periodSeconds","value":15}
-    ]' 2>/dev/null && info "Operator startupProbe patched for QEMU." || true
-  fi
-
   # ActiveGate: wait for StatefulSet then patch probe timeouts
   echo "⏳ Waiting for ActiveGate StatefulSet..."
   AG_TIMEOUT=60
@@ -192,6 +207,21 @@ docker build -t todo-service:latest .
 
 # ── 9. Deploy the application ─────────────────────────────────
 step "Deploying todo-service application"
+
+# Wait for CSI driver DaemonSet pods — the app init container depends on them.
+echo "⏳ Waiting for Dynatrace CSI driver pods..."
+CSI_TIMEOUT=180
+until kubectl get daemonset dynatrace-oneagent-csi-driver -n dynatrace &>/dev/null; do
+  CSI_TIMEOUT=$((CSI_TIMEOUT - 5))
+  if [[ "${CSI_TIMEOUT}" -le 0 ]]; then
+    warn "CSI driver DaemonSet not found — app pods may stay in Init state until it appears."
+    break
+  fi
+  sleep 5
+done
+kubectl -n dynatrace rollout status daemonset/dynatrace-oneagent-csi-driver --timeout=300s 2>/dev/null \
+  || warn "CSI driver not fully ready — continuing anyway."
+
 kubectl apply -f k8s/namespace.yaml        # creates todo-app namespace with DT inject label
 kubectl apply -f k8s/postgres-secret.yaml
 kubectl apply -f k8s/postgres-pvc.yaml
@@ -205,8 +235,14 @@ kubectl apply -f k8s/app-ingress.yaml
 # Ensure the namespace carries the DT injection label (idempotent)
 kubectl label namespace todo-app dynatrace.com/inject=true --overwrite
 
-# Restart the deployment so any already-running pods pick up the OneAgent init container
-kubectl rollout restart deployment/todo-service -n todo-app
+# On re-runs, restart so existing pods pick up the OneAgent init container.
+# On fresh installs this is a no-op if pods were just created with injection already.
+INJECTED=$(kubectl get pods -n todo-app -l app=todo-service \
+  -o jsonpath='{.items[0].spec.initContainers[0].name}' 2>/dev/null || echo "")
+if [[ -z "${INJECTED}" ]]; then
+  info "No running todo-service pods with DT injection detected — restarting deployment."
+  kubectl rollout restart deployment/todo-service -n todo-app
+fi
 
 # ── 10. Wait for pods to be ready ─────────────────────────────
 step "Waiting for pods"
