@@ -1,0 +1,81 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: liquibase-update
+  namespace: liquibase-poc
+  labels:
+    app: liquibase-poc
+    component: migrate
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: liquibase-poc
+        component: migrate
+    spec:
+      restartPolicy: Never
+      # Wait for SQL Server to accept connections, then ensure the `service` DB
+      # exists. We reuse the migrate image (Liquibase + MSSQL JDBC) so this
+      # stays ARM-native on Apple Silicon kind nodes — no sqlcmd container
+      # under emulation. `liquibase execute-sql` against `master` runs the
+      # CREATE DATABASE statement via JDBC.
+      initContainers:
+        - name: wait-and-create-db
+          image: poc-migrate:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              echo "Waiting for mssql:1433..."
+              for i in $(seq 1 60); do
+                if (exec 3<>/dev/tcp/mssql/1433) 2>/dev/null; then
+                  echo "TCP open"
+                  break
+                fi
+                sleep 5
+              done
+              # Liquibase opens the JDBC connection with autocommit, so
+              # CREATE DATABASE (which can't run inside a transaction in MSSQL)
+              # works fine here.
+              /liquibase/liquibase \
+                --url="jdbc:sqlserver://mssql:1433;databaseName=master;encrypt=false" \
+                --username=sa \
+                --password="$SA_PWD" \
+                execute-sql --sql="IF DB_ID('service') IS NULL CREATE DATABASE service"
+          env:
+            - name: SA_PWD
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: password
+      containers:
+        - name: liquibase
+          image: poc-migrate:0.1.0
+          imagePullPolicy: IfNotPresent
+          # K8s' $(VAR) syntax substitutes from env at pod start, so the
+          # password never appears as a literal in the pod spec / API server logs.
+          args:
+            - --changelog-file=db/changelog/db.changelog-master.xml
+            - --url=$(JDBC_URL)
+            - --username=$(DB_USER)
+            - --password=$(DB_PASS)
+            - update
+          env:
+            - name: JDBC_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: jdbc-url
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: username
+            - name: DB_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: password

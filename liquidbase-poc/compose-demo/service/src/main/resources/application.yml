@@ -1,0 +1,13 @@
+spring:
+  application:
+    name: poc-service
+  datasource:
+    url: ${DB_URL:jdbc:sqlserver://localhost:1433;databaseName=service;encrypt=false}
+    username: ${DB_USER:sa}
+    password: ${DB_PASS:Liquib@se-PoC-2026}
+    driver-class-name: com.microsoft.sqlserver.jdbc.SQLServerDriver
+  liquibase:
+    enabled: true
+    change-log: classpath:db/changelog/db.changelog-master.xml
+server:
+  port: 8081

@@ -1,0 +1,45 @@
+# Reference shape only. NOT located under .github/workflows on purpose so it
+# isn't auto-registered with GitHub Actions. Mirror the body of compose-demo
+# apply mode 2 (apply.sh inside the Ubuntu runner image).
+name: DB Migrate Apply (example)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: string
+      release_tag:
+        description: Migration image tag
+        required: true
+        type: string
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Real impl would auth to the target cluster here
+      # (aws eks update-kubeconfig / gcloud / az aks get-credentials / etc.)
+      - name: Cluster auth
+        run: echo "stub for cluster auth in ${{ inputs.environment }}"
+
+      - name: Build migration image
+        run: |
+          docker build \
+            -f k8s-demo/migrate-image/Dockerfile \
+            -t ghcr.io/${{ github.repository }}/poc-migrate:${{ inputs.release_tag }} .
+
+      - name: Push migration image
+        run: docker push ghcr.io/${{ github.repository }}/poc-migrate:${{ inputs.release_tag }}
+
+      - name: Render and apply Job
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}/poc-migrate:${{ inputs.release_tag }}
+        run: |
+          # Real impl would template the Job manifest with $IMAGE and apply.
+          # For the PoC, see k8s-demo/manifests/job.yaml as the static shape.
+          echo "would apply Job with image=$IMAGE"

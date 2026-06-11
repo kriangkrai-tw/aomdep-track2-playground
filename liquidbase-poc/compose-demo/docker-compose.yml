@@ -1,0 +1,97 @@
+# Apply modes 1 and 2 of the Liquibase PoC.
+#
+# Default `up` brings up MSSQL + Adminer + a one-shot db-init that creates the
+# `service` database. Profiles select an apply path:
+#
+#   docker compose --profile spring up --build       # mode 1: Spring embedded apply
+#   docker compose --profile runner run --rm runner  # mode 2: Ubuntu runner with Liquibase CLI
+#
+# Adminer is at http://localhost:8080. Spring service (mode 1) at http://localhost:8081.
+
+services:
+  # SQL Server 2022 is amd64-only. On Apple Silicon, Docker Desktop must have
+  # Rosetta emulation enabled (Settings → General → "Use Rosetta for x86_64/amd64
+  # emulation on Apple Silicon"). Without Rosetta, QEMU emulation hangs.
+  # First boot under Rosetta takes 60-120s; subsequent boots are quicker.
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    container_name: poc-mssql
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${SA_PWD:-Liquib@se-PoC-2026}
+      MSSQL_PID: Developer
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -C -Q "SELECT 1" || exit 1
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+  db-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    container_name: poc-db-init
+    depends_on:
+      mssql:
+        condition: service_healthy
+    environment:
+      MSSQL_SA_PASSWORD: ${SA_PWD:-Liquib@se-PoC-2026}
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        /opt/mssql-tools18/bin/sqlcmd -S mssql -U sa -P "$$MSSQL_SA_PASSWORD" -C \
+          -Q "IF DB_ID('service') IS NULL CREATE DATABASE service;"
+    restart: "no"
+
+  adminer:
+    image: adminer:4
+    container_name: poc-adminer
+    ports:
+      - "8080:8080"
+    depends_on:
+      - mssql
+
+  service:
+    profiles: ["spring"]
+    build: ./service
+    container_name: poc-service
+    depends_on:
+      mssql:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    environment:
+      DB_URL: "jdbc:sqlserver://mssql:1433;databaseName=service;encrypt=false"
+      DB_USER: sa
+      DB_PASS: ${SA_PWD:-Liquib@se-PoC-2026}
+    ports:
+      - "8081:8081"
+
+  runner:
+    profiles: ["runner"]
+    build: ./runner
+    container_name: poc-runner
+    depends_on:
+      mssql:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    environment:
+      DB_URL: "jdbc:sqlserver://mssql:1433;databaseName=service;encrypt=false"
+      DB_USER: sa
+      DB_PASS: ${SA_PWD:-Liquib@se-PoC-2026}
+    volumes:
+      # Mount the `db/` parent so include paths inside the master XML match
+      # Spring Boot's classpath layout (src/main/resources/ as the root).
+      # That keeps DATABASECHANGELOG.FILENAME consistent across modes.
+      - ./service/src/main/resources/db:/workspace/db:ro
+
+volumes:
+  mssql-data:
