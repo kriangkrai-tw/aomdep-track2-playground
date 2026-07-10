@@ -1,0 +1,37 @@
+otelcol.receiver.otlp "ingest" {
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+
+  http {
+    endpoint = "0.0.0.0:4318"
+
+    cors {
+      allowed_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+      allowed_headers = ["*"]
+    }
+  }
+
+  output {
+    traces = [otelcol.processor.batch.default.input]
+  }
+}
+
+otelcol.processor.batch "default" {
+  output {
+    traces = [otelcol.exporter.otlp.tempo.input]
+  }
+}
+
+otelcol.exporter.otlp "tempo" {
+  client {
+    endpoint = "tempo:4317"
+    headers = {
+      "X-Scope-OrgID" = "shared-trace",
+    }
+
+    tls {
+      insecure = true
+    }
+  }
+}

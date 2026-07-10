@@ -1,0 +1,4 @@
+com/example/tracingpoc/TracingPocApplication.class
+com/example/tracingpoc/TracingController$DownstreamTraceResponse.class
+com/example/tracingpoc/TracingController$TraceResponse.class
+com/example/tracingpoc/TracingController.class

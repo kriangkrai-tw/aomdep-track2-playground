@@ -1,0 +1,89 @@
+services:
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_AGENT_API_BASE_URL: http://localhost:8080
+        VITE_OTEL_EXPORTER_URL: http://localhost:4318/v1/traces
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+      - backend-sdk
+      - alloy
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      SDK_API_BASE_URL: http://backend-sdk:8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      - alloy
+
+  backend-sdk:
+    build:
+      context: ./backend-sdk
+    ports:
+      - "8082:8080"
+      - "8081:8081"
+    depends_on:
+      - alloy
+
+  alloy:
+    image: grafana/alloy:latest
+    command:
+      - run
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    depends_on:
+      - tempo
+
+  tempo:
+    image: grafana/tempo:latest
+    user: "0:0"
+    command:
+      - -config.file=/etc/tempo.yml
+    volumes:
+      - ./tempo/tempo.yml:/etc/tempo.yml:ro
+      - tempo-data:/tmp/tempo
+    ports:
+      - "3200:3200"
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_ORG_CREATE: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - tempo
+
+  grafana-bootstrap:
+    image: python:3.12-alpine
+    restart: on-failure
+    command:
+      - python
+      - /workspace/bootstrap.py
+    environment:
+      GRAFANA_URL: http://grafana:3000
+      GRAFANA_ADMIN_USER: admin
+      GRAFANA_ADMIN_PASSWORD: admin
+      GRAFANA_TEMPO_URL: http://tempo:3200
+      TEMPO_TENANT_ID: shared-trace
+    volumes:
+      - ./grafana/bootstrap:/workspace:ro
+    depends_on:
+      - grafana
+
+volumes:
+  tempo-data:

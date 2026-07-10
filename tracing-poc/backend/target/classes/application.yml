@@ -1,0 +1,9 @@
+server:
+  port: ${SERVER_PORT:8080}
+
+demo:
+  sdk-base-url: ${SDK_API_BASE_URL:http://backend-sdk:8081}
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %5p traceId=%X{trace_id:-} spanId=%X{span_id:-} [%thread] %logger{36} - %msg%n"
